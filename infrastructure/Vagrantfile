@@ -1,7 +1,8 @@
 # -*- mode: ruby -*-
 # vi: set ft=ruby :
 
-VM_IP = "192.168.56.10"
+VM_IP         = "192.168.56.10"
+TRIVY_VERSION = "0.74.0"
 
 Vagrant.configure("2") do |config|
   config.vm.box = "bento/ubuntu-24.04"
@@ -16,31 +17,129 @@ Vagrant.configure("2") do |config|
   # а на macOS порт 5000 часто занят службой AirPlay Receiver
   config.vm.network "forwarded_port", guest: 8080, host: 8080, host_ip: "127.0.0.1"
 
+  # Код проекта (каталог на уровень выше Vagrantfile) доступен в VM
+  config.vm.synced_folder "..", "/home/vagrant/devsecops-lab"
+
   config.vm.provider "virtualbox" do |vb|
     vb.name   = "devsecops-vm"
-    vb.memory = 1024
-    vb.cpus   = 1
+    # Сборка образов и Trivy внутри VM: 1 ГБ мало, база Trivy занимает
+    # сотни мегабайт в памяти. 2 ГБ - объем из требований методички
+    vb.memory = 2048
+    vb.cpus   = 2
   end
 
   # config.ssh.insert_key НЕ отключаем: Vagrant создаст для VM
   # собственную пару ключей вместо общеизвестного "insecure key"
 
+  # ---------- 0. Сеть ----------
+  # VirtualBox на Apple Silicon: при включенном offloading сетевой карты
+  # крупные пакеты контейнеров (через docker0 и NAT) теряются, pip внутри
+  # docker build падает с Read timed out. Отключаем offloading через службу
+  # systemd, чтобы настройка сохранялась после перезагрузки VM.
+  # IPv6 в NAT VirtualBox не работает, поэтому предпочитаем IPv4
+  config.vm.provision "shell", name: "network", inline: <<-SHELL
+    set -euo pipefail
+
+    cat > /etc/systemd/system/disable-offload.service <<'UNIT'
+[Unit]
+Description=Disable NIC offloading (VirtualBox NAT workaround)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ethtool -K eth0 tso off gso off gro off
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable disable-offload.service
+    systemctl restart disable-offload.service
+
+    # Строка добавляется, только если ее еще нет
+    LINE="precedence ::ffff:0:0/96  100"
+    grep -qxF "$LINE" /etc/gai.conf || echo "$LINE" >> /etc/gai.conf
+  SHELL
+
+  # ---------- 1. Docker ----------
   config.vm.provision "shell", name: "docker", inline: <<-SHELL
     set -euo pipefail
     export DEBIAN_FRONTEND=noninteractive
 
+    # apt-get install идемпотентен: уже установленные пакеты не трогаются
     apt-get update
-    apt-get install -y docker.io docker-buildx curl
+    apt-get install -y docker.io docker-buildx curl python3-flask python3-pytest
 
     # Docker без sudo - только для пользователя vagrant.
-    # Помните: членство в группе docker фактически равно правам root
+    # Помните: членство в группе docker фактически равно правам root.
+    # Повторный usermod -aG ничего не дублирует
     usermod -aG docker vagrant
 
-    # Разрешаем HTTP-доступ к учебному реестру (только для учебной сети!)
+    # Разрешаем HTTP-доступ к учебному реестру (только для учебной сети!).
+    # Docker перезапускается, только если конфигурация действительно изменилась
     mkdir -p /etc/docker
-    echo '{ "insecure-registries": ["#{VM_IP}:5000"] }' > /etc/docker/daemon.json
+    NEW_CFG='{ "insecure-registries": ["#{VM_IP}:5000"] }'
+    if [ "$(cat /etc/docker/daemon.json 2>/dev/null || true)" != "$NEW_CFG" ]; then
+      echo "$NEW_CFG" > /etc/docker/daemon.json
+      systemctl restart docker
+    fi
+    systemctl enable --now docker
+  SHELL
 
-    systemctl enable docker
-    systemctl restart docker
+  # ---------- 2. Реестр образов ----------
+  config.vm.provision "shell", name: "registry", inline: <<-SHELL
+    set -euo pipefail
+
+    # Контейнер создается, только если его еще нет
+    if ! docker inspect registry >/dev/null 2>&1; then
+      docker run -d --name registry --restart=always \
+        -p 5000:5000 -v registry-data:/var/lib/registry registry:3
+    fi
+    # Если контейнер есть, но остановлен - запускаем
+    docker start registry >/dev/null
+
+    # Ждем, пока API реестра начнет отвечать
+    for i in $(seq 1 30); do
+      curl -fsS http://localhost:5000/v2/ >/dev/null && break
+      sleep 1
+    done
+    echo "registry: $(curl -fsS http://localhost:5000/v2/_catalog)"
+  SHELL
+
+  # ---------- 3. Trivy фиксированной версии ----------
+  config.vm.provision "shell", name: "trivy", inline: <<-SHELL
+    set -euo pipefail
+    TRIVY_VERSION="#{TRIVY_VERSION}"
+
+    # Ничего не делаем, если нужная версия уже установлена
+    if command -v trivy >/dev/null 2>&1 \
+       && trivy --version | grep -q "Version: ${TRIVY_VERSION}$"; then
+      echo "trivy ${TRIVY_VERSION} already installed"
+      exit 0
+    fi
+
+    # Архитектура VM: arm64 на Apple Silicon, amd64 на остальных хостах
+    case "$(dpkg --print-architecture)" in
+      amd64) ARCH="64bit" ;;
+      arm64) ARCH="ARM64" ;;
+      *) echo "unsupported architecture"; exit 1 ;;
+    esac
+
+    TMP="$(mktemp -d)"
+    trap 'rm -rf "$TMP"' EXIT
+    cd "$TMP"
+
+    BASE="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+    ARCHIVE="trivy_${TRIVY_VERSION}_Linux-${ARCH}.tar.gz"
+    curl -sSfLO "${BASE}/${ARCHIVE}"
+    curl -sSfLO "${BASE}/trivy_${TRIVY_VERSION}_checksums.txt"
+    # Проверка контрольной суммы: при несовпадении set -e остановит скрипт
+    sha256sum --ignore-missing -c "trivy_${TRIVY_VERSION}_checksums.txt"
+
+    tar -xzf "${ARCHIVE}" trivy
+    install -m 0755 trivy /usr/local/bin/trivy
+    trivy --version
   SHELL
 end
